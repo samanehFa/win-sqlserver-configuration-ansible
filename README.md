@@ -1,4 +1,4 @@
-# Ansible Role: Secret Bootstrapper
+# Ansible Role: configuration of Windows MSSQL with Ansible
 
 This Ansible role is designed to install secure files and bootstrap secret handling for a system using predefined configuration and installation assets.
 
