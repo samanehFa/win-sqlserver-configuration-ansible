@@ -1,0 +1,7 @@
+---
+- name: Get disk facts from Windows hosts
+  community.windows.win_disk_facts:
+
+- name: Output disk facts
+  ansible.builtin.debug:
+    var: ansible_facts.disks[1]

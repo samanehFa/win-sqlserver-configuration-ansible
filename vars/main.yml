@@ -1,0 +1,22 @@
+---
+
+ansible_connection: winrm
+ansible_winrm_server_cert_validation: ignore
+ansible_port: 5986
+ansible_winrm_transport: kerberos
+ansible_winrm_kerberos_delegation: true
+ansible_winrm_operation_timeout_sec: 60
+ansible_winrm_read_timeout_sec: 90
+ansible_winrm_kinit_mode: managed
+ansible_winrm_kinit_cmd: kinit
+rl_mssql_sapwd: ""
+sql_service_account: ""
+sql_service_password: ""
+sql_agent_account: ""
+sql_agent_password: ""
+sa_password: ""
+domain: 
+dbowner_user: 
+server_name: ""
+sql_instance: "" 
+sql_username: ""  

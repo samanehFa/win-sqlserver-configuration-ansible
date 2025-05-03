@@ -1,0 +1,601 @@
+---
+
+- name: Determine if the default instance exists.
+  ansible.windows.win_service:
+    name: 'MSSQLSERVER'
+  register: service_info
+
+- name: Initialize disks
+  include_tasks: "../tasks/playbook_diskPrep.yml"
+
+- name: Create temp folder on target
+  win_file:
+    path: 'C:\temp'
+    state: directory
+  when:
+    - not service_info.exists
+
+- name: Create Temp directory
+  win_file:
+    path: 'C:\Temp'
+    state: directory
+
+# Determine if the default instance exists
+- name: Determine if the default instance exists
+  win_service:
+    name: 'MSSQLSERVER'
+  register: service_info
+
+# Set Windows power plan to high performance
+- name: Set Windows power plan to high performance
+  win_power_plan:
+    name: high performance
+  when:
+    - not service_info.exists
+
+# Copy ISO to target
+- name: Copy ISO to target
+  win_copy:
+    src: "{{ sql_iso_filename }}"
+    dest: ""
+  when:
+    - not service_info.exists
+
+# Copy the configuration.ini file to target
+- name: Copy the configuration.ini file to target
+  template:
+    src: templates/configuration.ini.j2
+    dest: C:\Temp\configuration.ini 
+  when:
+    - not service_info.exists
+
+# Mount the SQL Server ISO
+- name: Mount ISO
+  win_disk_image:
+    image_path: ''
+    state: present
+  register: disk_image_out
+  when:
+    - not service_info.exists
+
+# Set SQL Server SA password
+- name: SQL Server SA password
+  set_fact:
+    sa_password_switch: "{{ '/SAPWD={{ rl_mssql_sapwd }}' }}"
+  when:
+    - not service_info.exists
+
+- name: Clean TempDB directory
+  win_file:
+    path: 'D:\\TempDB'
+    state: absent
+  when: service_info.exists == false
+
+- name: Recreate TempDB directory
+  win_file:
+    path: 'D:\\TempDB'
+    state: directory
+  when: service_info.exists == false
+
+
+# Install Default instance
+- name: Install Default instance
+  win_command:
+    cmd: '{{ disk_image_out.mount_paths[0] }}setup.exe /ConfigurationFile=C:\temp\Configuration.ini {{ sa_password_switch }} /IAcceptSQLServerLicenseTerms'
+  when:
+    - not service_info.exists
+
+# Unmount ISO after installation
+- name: Unmount ISO
+  win_disk_image:
+    image_path: ""
+    state: absent
+  when:
+    - not service_info.exists
+
+- name: Set Full-Text Upgrade Option to 'Import'
+  ansible.windows.win_shell: |
+    sqlcmd -S "{{ sql_instance }}" -U "{{ sql_username }}" -P "{{ sa_password }}" -Q "EXEC sp_fulltext_service 'upgrade_option', 1;"
+
+
+#Copy the SSMS installer to the target server
+- name: Copy SSMS installer to destination server
+  ansible.windows.win_copy:
+    src: "{{ ssms_installer }}"
+    dest: C:\Temp\{{ ssms_installer }}
+
+- name: Check if SSMS is installed
+  win_stat:
+    path: C:\Program Files (x86)\Microsoft SQL Server Management Studio 20
+  register: ssms_installed
+
+- name: Install SQL Server Management Studio (SSMS)
+  win_command:
+    cmd: C:\Temp\{{ ssms_installer }} /install /quiet /norestart /log C:\Temp\ssms_install.log
+  when: not ssms_installed.stat.exists
+
+- name: Grant priviledge to SQL Server service account
+  win_shell: |
+    secedit /export /cfg C:\Temp\secpol.cfg
+    (Get-Content -Path C:\Temp\secpol.cfg) -replace 'SeManageVolumePrivilege =', 'SeManageVolumePrivilege = {{ sql_service_account }}' | Set-Content -Path C:\Temp\secpol.cfg
+    secedit /configure /db secedit.sdb /cfg C:\Temp\secpol.cfg /areas USER_RIGHTS
+    Remove-Item C:\Temp\secpol.cfg
+  args:
+    creates: C:\Temp\secpol.cfg
+
+- name: Grant Full Control to SQLSERVERAGENT on Log folder
+  win_acl:
+    path: "D:\\<SQL_PATH>\\MSSQL\\Log"
+    user: "NT SERVICE\\SQLSERVERAGENT"
+    rights: FullControl
+    type: allow
+    inheritance: true
+    propagation: InheritOnly
+
+- name: Enable TCP/IP for MSSQLSERVER via Registry
+  win_regedit:
+    path: HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server\MSSQL16.MSSQLSERVER\MSSQLServer\SuperSocketNetLib\Tcp\IPAll
+    name: Enabled
+    data: 1
+    type: dword
+    state: present
+  when: service_info.exists
+
+- name: Enable Force Encryption for MSSQLSERVER
+  win_shell: |
+    Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server\MSSQL16.MSSQLSERVER\MSSQLServer\SuperSocketNetLib" -Name "ForceEncryption" -Value 0
+  register: disable_encryption
+
+- name: Stop SQL Server Agent
+  ansible.windows.win_service:
+    name: SQLSERVERAGENT
+    state: stopped
+
+- name: Stop SQL Server Service
+  win_service:
+    name: MSSQLSERVER
+    state: stopped
+
+- name: Start SQL Server Service
+  win_service:
+    name: MSSQLSERVER
+    state: started
+
+- name: Start SQL Server Agent
+  ansible.windows.win_service:
+    name: SQLSERVERAGENT
+    state: started
+
+- name: Verify Service State
+  ansible.windows.win_service_info:
+    name: MSSQLSERVER
+  register: sql_service_info
+
+- name: Debug Service State
+  debug:
+    msg: "SQL Server service is {{ sql_service_info.services[0].state }}"
+
+- name: Enable advanced options in SQL Server
+  win_shell: |
+    sqlcmd -S "{{ sql_instance }}" -U "{{ sql_username }}" -P "{{ sa_password }}" -Q "EXEC sp_configure 'show advanced options', 1; RECONFIGURE;"
+
+- name: Set SQL Server Maximum Memory to 80% of physical memory (leave 2GB for OS)
+  ansible.windows.win_shell: |
+    $totalMem = (Get-CimInstance -ClassName Win32_ComputerSystem).TotalPhysicalMemory / 1MB
+    $eightyPercent = [math]::Floor($totalMem * 0.8)
+    $leaveTwoGB = [math]::Floor($totalMem - 2048)
+    $maxSqlMem = [math]::Min($eightyPercent, $leaveTwoGB)
+    sqlcmd -S "{{ sql_instance }}" -U "{{ sql_username }}" -P "{{ sa_password }}" -Q "EXEC sp_configure 'show advanced options', 1; RECONFIGURE; EXEC sp_configure 'max server memory (MB)', $maxSqlMem; RECONFIGURE;"
+ 
+- name: Set LoginAuditLevel to 3 (both failed and successful logins)
+  ansible.windows.win_regedit:
+    path: HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server\MSSQLSERVER\MSSQLServer
+    name: LoginAuditLevel
+    data: 3
+    type: dword
+
+- name: Restart SQL Server service to apply changes
+  ansible.windows.win_service:
+    name: MSSQLSERVER
+    state: restarted
+    force_dependent_services: true
+
+- name: Verify LoginAuditLevel from registry
+  ansible.windows.win_shell: |
+    reg query "HKLM\SOFTWARE\Microsoft\Microsoft SQL Server\MSSQLSERVER\MSSQLServer" /v LoginAuditLevel
+  register: login_audit_check
+
+- debug:
+    var: login_audit_check.stdout
+
+
+- name: Set default index fill factor to 90%
+  win_shell: |
+    sqlcmd -S "{{ sql_instance }}" -U "{{ sql_username }}" -P "{{ sa_password }}" -Q "EXEC sp_configure 'fill factor (%)', 90; RECONFIGURE;"
+  args:
+    executable: cmd
+  register: set_fill_factor
+
+- name: Create index on backupset table
+  win_shell: |
+    sqlcmd -S "{{ sql_instance }}" -U "{{ sql_username }}" -P "{{ sa_password }}" -Q "
+    USE msdb;
+    IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name='IX_BackupSet_BackupDate_DBName')
+    BEGIN
+      CREATE INDEX IX_BackupSet_BackupDate_DBName
+      ON backupset (backup_start_date, database_name);
+    END
+    "
+  register: index_backupset_result
+
+- name: Create index on backupmediafamily table
+  win_shell: |
+    sqlcmd -S "{{ sql_instance }}" -U "{{ sql_username }}" -P "{{ sa_password }}" -Q "
+    USE msdb;
+    IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name='IX_BackupMediaFamily_PhysicalDevice')
+    BEGIN
+      CREATE INDEX IX_BackupMediaFamily_PhysicalDevice
+      ON backupmediafamily (physical_device_name);
+    END
+    "
+  register: index_backupmediafamily_result
+
+- name: Debug index creation results
+  debug:
+    msg:
+      - "Backupset Index: {{ index_backupset_result.stdout }}"
+      - "BackupMediaFamily Index: {{ index_backupmediafamily_result.stdout }}"
+
+
+#Configuring Database Mail
+- name: Enable Database Mail
+  ansible.windows.win_shell: |
+    sqlcmd -S "{{ sql_instance }}" -U "{{ sql_username }}" -P "{{ sa_password }}" -Q "
+    EXEC sp_configure 'show advanced options', 1;
+    RECONFIGURE;
+    EXEC sp_configure 'Database Mail XPs', 1;
+    RECONFIGURE;"
+
+- name: Create Database Mail Profile
+  ansible.windows.win_shell: |
+    sqlcmd -S "{{ sql_instance }}" -U "{{ sql_username }}" -P "{{ sa_password }}" -Q "
+    EXEC msdb.dbo.sysmail_add_profile_sp
+    @profile_name = 'SMTP Account',
+    @description = 'Mail profile for notifications';"
+
+- name: Create Database Mail Account
+  ansible.windows.win_shell: |
+    sqlcmd -S "{{ sql_instance }}" -U "{{ sql_username }}" -P "{{ sa_password }}" -Q "
+    EXEC msdb.dbo.sysmail_add_account_sp
+        @account_name = 'SMTP Account',
+        @description = 'SMTP Mail Account',
+        @email_address = '{{ notification_email }}',
+        @mailserver_name = '{{ smtp_server }}',
+        @port = 25,
+        @enable_ssl = 1;"
+
+- name: Link Account to Profile
+  ansible.windows.win_shell: |
+    sqlcmd -S "{{ sql_instance }}" -U "{{ sql_username }}" -P "{{ sa_password }}" -Q "
+    EXEC msdb.dbo.sysmail_add_profileaccount_sp
+    @profile_name = 'SMTP Account',
+    @account_name = 'SMTP Account',
+    @sequence_number = 1;"
+
+- name: Set Profile as Public and Default
+  ansible.windows.win_shell: |
+    sqlcmd -S "{{ sql_instance }}" -U "{{ sql_username }}" -P "{{ sa_password }}" -Q "
+    EXEC msdb.dbo.sysmail_add_principalprofile_sp
+    @profile_name = 'SMTP Account',
+    @principal_name = 'public',
+    @is_default = 1;"
+
+- name: Send Test Email
+  ansible.windows.win_shell: |
+    sqlcmd -S "{{ sql_instance }}" -U "{{ sql_username }}" -P "{{ sa_password }}" -Q "
+    EXEC msdb.dbo.sp_send_dbmail
+    @profile_name = 'SMTP Account',
+    @recipients = '{{ test_recipient_email }}',
+    @subject = 'Test Email',
+    @body = 'This is a test email sent via Ansible setup.';"
+
+
+#SQL Server Agent Configuration
+- name: Create SQL Agent Operator - onalerts-low
+  ansible.windows.win_shell: |
+    sqlcmd -S "{{ sql_instance }}" -U "{{ sql_username }}" -P "{{ sa_password }}" -Q "
+    EXEC msdb.dbo.sp_add_operator
+    @name = '{{ alert_operator_email }}',
+    @enabled = 1,
+    @email_address = '{{ alert_operator_email }}';"
+
+- name: Create SQL Agent Operator - servicecheck
+  ansible.windows.win_shell: |
+    sqlcmd -S "{{ sql_instance }}" -U "{{ sql_username }}" -P "{{ sa_password }}" -Q "
+    EXEC msdb.dbo.sp_add_operator
+    @name = 'servicecheck@onmail.oevermann.de',
+    @enabled = 1,
+    @email_address = 'servicecheck@onmail.oevermann.de';"
+
+- name: Enable SQL Server Agent Mail Profile
+  ansible.windows.win_shell: |
+    sqlcmd -S "{{ sql_instance }}" -U "{{ sql_username }}" -P "{{ sa_password }}" -Q "
+    EXEC msdb.dbo.sp_set_sqlagent_properties
+    @email_save_in_sent_folder = 1,
+    @databasemail_profile = 'SMTP Account';"
+
+# - name: Create Fail-Safe Operator
+#   ansible.windows.win_shell: |
+#     sqlcmd -S "{{ sql_instance }}" -U "{{ sql_username }}" -P "{{ sa_password }}" -Q "
+#     IF NOT EXISTS (SELECT * FROM msdb.dbo.sysoperators WHERE name = 'FailsafeOperator')
+#     BEGIN
+#       EXEC msdb.dbo.sp_add_operator  
+#         @name = 'FailsafeOperator',
+#         @enabled = 1,
+#         @email_address = '';
+#     END"
+
+# - name: Enable Fail-Safe Operator
+#   ansible.windows.win_shell: |
+#     sqlcmd -S "{{ sql_instance }}" -U "{{ sql_username }}" -P "{{ sa_password }}" -Q "
+#     USE [msdb];
+#     EXEC master.dbo.sp_MSsetalertinfo 
+#       @failsafeoperator = N'FailsafeOperator', 
+#       @notificationmethod = 1;"
+
+- name: Transfer and Execute SQL Scripts
+  ansible.windows.win_copy:
+    src: SQLServer2016
+    dest: path\to\des\
+
+
+# - name: Execute SQL Scripts
+#   ansible.windows.win_shell: |
+#     sqlcmd -S "{{ sql_instance }}" -U "{{ sql_username }}" -P "{{ sa_password }}"  -i "D:\CMDB\dev\Abbreviation\HostingRepo\ServerInstallation\SQLServer2016\setup.sql"
+
+- name: Deactivate SQL Agent Backup Jobs
+  ansible.windows.win_shell: |
+    sqlcmd -S "{{ sql_instance }}" -U "{{ sql_username }}" -P "{{ sa_password }}" -Q "
+    UPDATE msdb.dbo.sysjobs SET enabled = 0 WHERE name LIKE '%backup%';"
+
+
+# - name: Set Error Notification for Maintenance Jobs
+#   ansible.windows.win_shell: |
+#     sqlcmd -S "{{ sql_instance }}" -U "{{ sql_username }}" -P "{{ sa_password }}" -Q "
+#     DECLARE @job_id UNIQUEIDENTIFIER;
+#     SELECT @job_id = job_id FROM msdb.dbo.sysjobs WHERE name = '  ';
+#     EXEC msdb.dbo.sp_update_job
+#     @job_id = @job_id,
+#     @notify_email_operator_name = 'onalerts-low@twt.de',
+#     @notify_level_email = 2;"
+
+
+#SQL Server DbOwner Configuration
+# - name: Create DbOwner Login in SQL Server
+#   ansible.windows.win_shell: |
+#     sqlcmd -S "{{ sql_instance }}" -U "{{ sql_username }}" -P "{{ sa_password }}" -Q "
+#     USE [master];
+#     CREATE LOGIN [{{ domain }}\\{{ dbowner_user }}] FROM WINDOWS WITH DEFAULT_DATABASE=[master];
+#     DENY CONNECT SQL TO [{{ domain }}\\{{ dbowner_user }}];
+#     ALTER LOGIN [{{ domain }}\\{{ dbowner_user }}] DISABLE;"
+
+- name: Transfer Check-DbOwner.sql Script
+  ansible.windows.win_copy:
+    src: SQLServer2016/Check-DbOwner.sql
+    dest: D:\CMDB\dev\Abbreviation\HostingRepo\ServerInstallation\SQLServer2016\Check-DbOwner.sql
+    remote_src: no
+
+# - name: Execute Check-DbOwner SQL Script
+#   ansible.windows.win_shell: |
+#     sqlcmd -S "{{ sql_instance }}" -U "{{ sql_username }}" -P "{{ sa_password }}" -i "D:\CMDB\dev\Abbreviation\HostingRepo\ServerInstallation\SQLServer2016\Check-DbOwner.sql"
+
+#service settings
+- name: Set MSSQLSERVER service startup to Delayed-Auto
+  ansible.windows.win_shell: |
+    cmd /c "sc.exe config MSSQLSERVER start= delayed-auto"
+
+- name: Configure MSSQLSERVER service failure actions
+  ansible.windows.win_shell: |
+    cmd /c "sc.exe failure MSSQLSERVER actions= restart/60000/restart/60000///180000 reset= 86400"
+
+- name: Set SQLSERVERAGENT service startup to Delayed-Auto
+  ansible.windows.win_shell: |
+    cmd /c "sc.exe config SQLSERVERAGENT start= delayed-auto"
+
+- name: Configure SQLSERVERAGENT service failure actions
+  ansible.windows.win_shell: |
+    cmd /c "sc.exe failure SQLSERVERAGENT actions= restart/60000/restart/60000///180000 reset= 86400"
+
+
+#optional configuration replication
+- name: Set Maximum Replication Data Size to Maximum
+  ansible.windows.win_shell: |
+    sqlcmd -S "{{ sql_instance }}" -U "{{ sql_username }}" -P "{{ sa_password }}" -Q "
+    EXEC sp_configure 'max text repl size', 2147483647;
+    RECONFIGURE;"
+
+- name: Check Current Max Text Replication Size
+  ansible.windows.win_shell: |
+    sqlcmd -S "{{ sql_instance }}" -U "{{ sql_username }}" -P "{{ sa_password }}" -Q "EXEC sp_configure"
+
+#Autogrow
+- name: Ensure SQLServerSQLAgentUsers group exists
+  ansible.windows.win_group:
+    name: SQLServerSQLAgentUsers
+    state: present
+
+- name: Ensure SQLServerSQLServerUsers group exists
+  ansible.windows.win_group:
+    name: SQLServerSQLServerUsers
+    state: present
+
+
+- name: Verify Local Groups Exist
+  ansible.windows.win_command: net localgroup
+
+- name: Verify User Rights Assignment for SQL Groups
+  ansible.windows.win_shell: |
+    secedit /export /cfg C:\secpol.cfg
+    findstr "Perform volume maintenance tasks" C:\secpol.cfg
+  register: secedit_output
+  failed_when: false
+
+- name: Set SQL Server default data location
+  ansible.windows.win_regedit:
+    path: HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server\MSSQL16.MSSQLSERVER\MSSQLServer
+    name: DefaultData
+    data: 'D:\MSSQL16.MSSQLSERVER\MSSQL\DATA'
+    type: string
+
+- name: Set SQL Server default log location
+  ansible.windows.win_regedit:
+    path: HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server\MSSQL16.MSSQLSERVER\MSSQLServer
+    name: DefaultLog
+    data: 'D:\MSSQL16.MSSQLSERVER\MSSQL\DATA'
+    type: string
+
+# Configure file system permissions for SQL users
+- name: Grant Read & Execute Permissions on Data Partition (D:\)
+  ansible.windows.win_acl:
+    path: D:\
+    user: ""  
+    rights: ReadAndExecute
+    type: allow
+    state: present
+
+- name: Ensure SQL Backup directory exists
+  ansible.windows.win_file:
+    path: D:\
+    state: directory
+
+- name: Grant Write Permissions on SQL Backup Directory (D:\MSSQL\Backup\)
+  ansible.windows.win_acl:
+    path: D:\MSSQL\Backup\
+    user: "" 
+    rights: Write
+    type: allow
+    state: present
+
+#Setting up SQL Agent jobs for SQL Server maintenance
+- name: Download Ola Hallengren's SQL Server Maintenance Solution
+  ansible.windows.win_get_url:
+    url: https://ola.hallengren.com/scripts/MaintenanceSolution.sql
+    dest: path\
+
+- name: Execute MaintenanceSolution.sql to create maintenance jobs
+  ansible.windows.win_shell: |
+    sqlcmd -S "{{ sql_instance }}" -U "{{ sql_username }}" -P "{{ sa_password }}" -i C:\Temp\MaintenanceSolution.sql
+
+- name: Enable and Schedule SQL Agent Jobs
+  ansible.windows.win_shell: |
+    sqlcmd -S "{{ sql_instance }}" -U "{{ sql_username }}" -P "{{ sa_password }}" -Q "
+    -- Enable jobs
+    EXEC msdb.dbo.sp_update_job @job_name = 'CommandLog Cleanup', @enabled = 1;
+    EXEC msdb.dbo.sp_update_job @job_name = 'DatabaseIntegrityCheck - SYSTEM_DATABASES', @enabled = 1;
+    EXEC msdb.dbo.sp_update_job @job_name = 'DatabaseIntegrityCheck - USER_DATABASES', @enabled = 1;
+    EXEC msdb.dbo.sp_update_job @job_name = 'IndexOptimize - USER_DATABASES', @enabled = 1;
+    EXEC msdb.dbo.sp_update_job @job_name = 'Output File Cleanup', @enabled = 1;
+    EXEC msdb.dbo.sp_update_job @job_name = 'sp_delete_backuphistory', @enabled = 1;
+    EXEC msdb.dbo.sp_update_job @job_name = 'sp_purge_jobhistory', @enabled = 1;
+    EXEC msdb.dbo.sp_update_job @job_name = 'syspolicy_purge_history', @enabled = 1;
+
+    -- Weekly schedule: CommandLog Cleanup
+    EXEC msdb.dbo.sp_add_schedule 
+      @schedule_name = 'CommandLog Cleanup Schedule',
+      @freq_type = 8,
+      @freq_interval = 1,               -- Sunday
+      @freq_recurrence_factor = 1,     -- Every week
+      @active_start_time = 40000;
+    EXEC msdb.dbo.sp_attach_schedule @job_name = 'CommandLog Cleanup', @schedule_name = 'CommandLog Cleanup Schedule';
+
+    -- Daily schedules
+    EXEC msdb.dbo.sp_add_schedule 
+      @schedule_name = 'DatabaseIntegrityCheck SYSTEM Daily',
+      @freq_type = 4,
+      @freq_interval = 1,
+      @active_start_time = 220000;
+    EXEC msdb.dbo.sp_attach_schedule @job_name = 'DatabaseIntegrityCheck - SYSTEM_DATABASES', @schedule_name = 'DatabaseIntegrityCheck SYSTEM Daily';
+
+    EXEC msdb.dbo.sp_add_schedule 
+      @schedule_name = 'DatabaseIntegrityCheck USER Daily',
+      @freq_type = 4,
+      @freq_interval = 1,
+      @active_start_time = 230000;
+    EXEC msdb.dbo.sp_attach_schedule @job_name = 'DatabaseIntegrityCheck - USER_DATABASES', @schedule_name = 'DatabaseIntegrityCheck USER Daily';
+
+    EXEC msdb.dbo.sp_add_schedule 
+      @schedule_name = 'IndexOptimize Daily',
+      @freq_type = 4,
+      @freq_interval = 1,
+      @active_start_time = 20000;
+    EXEC msdb.dbo.sp_attach_schedule @job_name = 'IndexOptimize - USER_DATABASES', @schedule_name = 'IndexOptimize Daily';
+
+    EXEC msdb.dbo.sp_add_schedule 
+      @schedule_name = 'Output File Cleanup Daily',
+      @freq_type = 4,
+      @freq_interval = 1,
+      @active_start_time = 10000;
+    EXEC msdb.dbo.sp_attach_schedule @job_name = 'Output File Cleanup', @schedule_name = 'Output File Cleanup Daily';
+
+    EXEC msdb.dbo.sp_add_schedule 
+      @schedule_name = 'sp_delete_backuphistory Daily',
+      @freq_type = 4,
+      @freq_interval = 1,
+      @active_start_time = 130000;
+    EXEC msdb.dbo.sp_attach_schedule @job_name = 'sp_delete_backuphistory', @schedule_name = 'sp_delete_backuphistory Daily';
+
+    EXEC msdb.dbo.sp_add_schedule 
+      @schedule_name = 'sp_purge_jobhistory Daily',
+      @freq_type = 4,
+      @freq_interval = 1,
+      @active_start_time = 50000;
+    EXEC msdb.dbo.sp_attach_schedule @job_name = 'sp_purge_jobhistory', @schedule_name = 'sp_purge_jobhistory Daily';
+
+    EXEC msdb.dbo.sp_add_schedule 
+      @schedule_name = 'syspolicy_purge_history Daily',
+      @freq_type = 4,
+      @freq_interval = 1,
+      @active_start_time = 230000;
+    EXEC msdb.dbo.sp_attach_schedule @job_name = 'syspolicy_purge_history', @schedule_name = 'syspolicy_purge_history Daily';
+    "
+
+
+- name: Verify SQL Agent Operator Exists
+  ansible.windows.win_shell: |
+    sqlcmd -S "{{ sql_instance }}" -U "{{ sql_username }}" -P "{{ sa_password }}" -Q "
+    EXEC msdb.dbo.sp_add_operator
+    @name = '',
+    @enabled = 1,
+    @email_address = '';"
+
+- name: Cleanup Temp Files
+  ansible.windows.win_file:
+    path: path\
+    state: absent
+
+- name: Set up email notifications for SQL Agent jobs on failure
+  ansible.windows.win_shell: |
+    sqlcmd -S "{{ sql_instance }}" -U "{{ sql_username }}" -P "{{ sa_password }}" -Q "
+    DECLARE @job_name NVARCHAR(128);
+    DECLARE job_cursor CURSOR FOR
+    SELECT name FROM msdb.dbo.sysjobs;
+
+    OPEN job_cursor;
+    FETCH NEXT FROM job_cursor INTO @job_name;
+
+    WHILE @@FETCH_STATUS = 0
+    BEGIN
+        EXEC msdb.dbo.sp_update_job 
+            @job_name = @job_name, 
+            @notify_level_email = 2,  -- 2 = Notify on Failure
+            @notify_email_operator_name = '';
+        FETCH NEXT FROM job_cursor INTO @job_name;
+    END
+
+    CLOSE job_cursor;
+    DEALLOCATE job_cursor;"
+  register: sql_agent_notification_result
+
+- name: Debug SQL Agent notification setup result
+  debug:
+    var: sql_agent_notification_result.stdout_lines
